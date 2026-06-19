@@ -15,11 +15,26 @@
 #include <sys/utsname.h>
 #endif
 
+#include <arpa/inet.h>
 #include <fcntl.h>
+#include <glib/gstdio.h>
 #include <locale.h>
+#include <net/if.h>
+#include <netinet/in.h>
 #include <string.h>
+#include <sys/ioctl.h>
+#include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+
+/*
+ * Minimal route flags from linux/route.h.
+ * We only need RTF_UP to avoid pulling in linux/if.h which
+ * redefines IFF_* and conflicts with net/if.h.
+ */
+#ifndef RTF_UP
+#define RTF_UP 0x0001 /* route usable */
+#endif
 
 #include "fwupd-bios-setting.h"
 #include "fwupd-client-private.h"
@@ -5977,33 +5992,177 @@ fwupd_client_download_error_is_fatal(const GError *error)
 	return TRUE;
 }
 
+#if GLIB_CHECK_VERSION(2, 66, 0)
+
+/*
+ * fwupd_client_check_interface_up:
+ * Use ioctl(SIOCGIFFLAGS) to check if the given interface is up
+ * and running.
+ *
+ * Returns: %TRUE if the interface is IFF_UP and IFF_RUNNING.
+ */
+static gboolean
+fwupd_client_check_interface_up (const gchar *iface)
+{
+	g_autofd gint fd = -1;
+	struct ifreq ifr = {};
+
+	fd = socket(AF_INET, SOCK_DGRAM, 0);
+	if (fd < 0)
+		return FALSE;
+
+	strncpy(ifr.ifr_name, iface, IFNAMSIZ - 1);
+	ifr.ifr_name[IFNAMSIZ - 1] = '\0';
+
+	if (/* nocheck:blocked */ ioctl(fd, SIOCGIFFLAGS, &ifr) < 0)
+		return FALSE;
+
+	if ((ifr.ifr_flags & IFF_UP) == 0)
+		return FALSE;
+	if ((ifr.ifr_flags & IFF_RUNNING) == 0)
+		return FALSE;
+
+	return TRUE;
+}
+
+/*
+ * fwupd_client_has_default_route_with_iface:
+ * Check for a default route in /proc/net/route and verify
+ * its interface is up via ioctl.
+ *
+ * Returns: %TRUE if a valid default route exists and its
+ *          interface is IFF_UP and IFF_RUNNING.
+ */
+static gboolean
+fwupd_client_has_default_route_with_iface (void)
+{
+	g_autofree gchar *route_data = NULL;
+	gsize data_len = 0;
+	g_autoptr(GError) error_local = NULL;
+	gchar *line = NULL;
+	gchar *endptr = NULL;
+	gchar *next = NULL;
+	gchar iface[17] = {};
+	guint32 dst = 0;
+	guint32 flags = 0;
+	guint i;
+
+	if (!g_file_get_contents("/proc/net/route", &route_data, &data_len, &error_local))
+		return FALSE;
+
+	line = route_data;
+
+	next = strchr(line, '\n');
+	if (next != NULL)
+		line = next + 1;
+
+	while (line < route_data + data_len) {
+		strncpy(iface, line, 16);
+		iface[16] = '\0';
+		line = strchr(line, '\t');
+		if (line == NULL)
+			break;
+		line++;
+
+		dst = (guint32)strtoul(line, &endptr, 16);
+		if (endptr == line)
+			break;
+		line = endptr + 1;
+
+		flags = (guint32)strtoul(line, &endptr, 16);
+		if (endptr == line)
+			break;
+		line = endptr + 1;
+
+		for (i = 0; i < 7; i++) {
+			line = strchr(line, '\t');
+			if (line == NULL)
+				break;
+			line++;
+		}
+		if (line == NULL || line >= route_data + data_len)
+			break;
+
+		if (dst == 0x00000000 && (flags & RTF_UP) != 0) {
+			if (fwupd_client_check_interface_up(iface))
+				return TRUE;
+		}
+
+		line = strchr(line, '\n');
+		if (line == NULL)
+			break;
+		line++;
+	}
+
+	return FALSE;
+}
+
+/*
+ * fwupd_client_check_network_reachable:
+ * Check if the network is reachable using a multi-layered approach
+ * that avoids spawning subprocesses or using GNetworkMonitor.
+ *
+ * The check works as follows:
+ *
+ * 1. Parse /proc/net/route for a default route (RTF_UP)
+ * 2. Use ioctl(SIOCGIFFLAGS) to verify the interface is IFF_UP | IFF_RUNNING
+ * 3. Use a UDP socket connect() with SO_SNDTIMEO as a final sanity check
+ *
+ * This avoids the GNetworkMonitor path which on Linux uses
+ * NetworkManager and pulls the entire kernel route table into memory,
+ * causing CPU/RAM exhaustion on systems with very large route tables
+ * (see #10525).
+ *
+ * Returns: %TRUE if the network is reachable.
+ */
+static gboolean
+fwupd_client_check_network_reachable (void)
+{
+	g_autofd gint fd = -1;
+	struct timeval tv;
+
+	if (!fwupd_client_has_default_route_with_iface())
+		return FALSE;
+
+	fd = socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, IPPROTO_UDP);
+	if (fd < 0)
+		return FALSE;
+
+	tv.tv_sec = 0;
+	tv.tv_usec = 500000;
+	if (setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv)) < 0)
+		return FALSE;
+
+	{
+		struct sockaddr_in addr = {};
+
+		addr.sin_family = AF_INET;
+		addr.sin_port = g_htons(53);
+		addr.sin_addr.s_addr = g_htonl(0x08080808);
+
+		if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0)
+			return FALSE;
+	}
+
+	return TRUE;
+}
+#endif
+
 static gboolean
 fwupd_client_test_network(const gchar *url, GError **error)
 {
 #if GLIB_CHECK_VERSION(2, 66, 0)
-	GNetworkMonitor *monitor;
-	g_autoptr(GUri) uri = NULL;
-	g_autoptr(GError) error_monitor = NULL;
-	g_autoptr(GSocketConnectable) address = NULL;
-
 	if (g_getenv("FWUPD_IGNORE_NETWORK_REACHABLE") != NULL)
 		return TRUE;
 
-	uri = g_uri_parse(url, G_URI_FLAGS_NONE, error);
-	if (uri == NULL)
-		return FALSE;
-
-	address = g_network_address_parse(g_uri_get_host(uri), g_uri_get_port(uri), error);
-	if (address == NULL)
-		return FALSE;
-
-	monitor = g_network_monitor_get_default();
-	if (!g_network_monitor_can_reach(monitor, address, NULL, &error_monitor)) {
-		g_set_error(error,
-			    FWUPD_ERROR,
-			    FWUPD_ERROR_NOT_REACHABLE,
-			    "network is unreachable: %s",
-			    error_monitor->message);
+	/* Use a lightweight network reachability check to avoid
+	 * GNetworkMonitor's expensive route table enumeration
+	 * (see #10525). */
+	if (!fwupd_client_check_network_reachable()) {
+		g_set_error_literal(error,
+				    FWUPD_ERROR,
+				    FWUPD_ERROR_NOT_REACHABLE,
+				    "network is unreachable");
 		return FALSE;
 	}
 #endif
